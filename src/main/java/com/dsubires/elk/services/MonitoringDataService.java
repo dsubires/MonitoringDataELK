@@ -38,20 +38,19 @@ import com.sun.jersey.api.client.WebResource;
 public class MonitoringDataService {
 
 	private ArrayList<DeviceStatus> elkData = new ArrayList<DeviceStatus>();
-	private ArrayList<DeviceStatus> warningHistory;
 	private Logger logger = LogManager.getLogger("MonitoringDataService");
 	@Value("${elastic.host}")
 	private String elasticHost;
 	@Value("${elastic.port}")
 	private Integer elasticPort;
-	@Value("${elastic.index}")
+	@Value("${elastic.index.store}")
 	private String elasticIndex;
+	@Value("${elastic.index.preprocessing}")
+	private String elasticIndexPreprocessing;
 	@Value("${pushbullet.url}")
 	private String pushbulletUrl;
 	@Value("${pushbullet.token}")
 	private String pushbulletToken;
-	@Value("${alert.history.filename}")
-	private String alertHistoryFilename;
 	@Value("${devices.temperature.threshold}")
 	private Integer devicesTemperatureThreshold;
 
@@ -60,20 +59,14 @@ public class MonitoringDataService {
 
 		logger.info("MonitoringDataDaemon starting at {}", new Date());
 
-		ArrayList<DeviceStatus> warning = new ArrayList<DeviceStatus>();
-		File tempFile = new File("elk.ser");
-		if (tempFile.exists()) {
-			warningHistory = deserializeData();
-		} else {
-			warningHistory = new ArrayList<DeviceStatus>();
-		}
-
 		try {
+			// query data from data_preprocessing index
 			RestClient restClient = RestClient.builder(new HttpHost(elasticHost, elasticPort, "http")).build();
-			Request request = new Request("GET", "/" + elasticIndex + "/_search?pretty");
+			Request request = new Request("GET", "/" + elasticIndexPreprocessing + "/_search?pretty");
 			String jsonInput = "{\r\n" + "	\"from\" : 0, \"size\" : 10000,\r\n" + "    \"query\": {\r\n"
 					+ "        \"match_all\": {}\r\n" + "    }\r\n" + "}";
 			request.setJsonEntity(jsonInput);
+
 			Response response = restClient.performRequest(request);
 			String json = EntityUtils.toString(response.getEntity());
 
@@ -81,76 +74,73 @@ public class MonitoringDataService {
 			JSONArray data = jsonObject.getJSONArray("hits");
 			Iterator<Object> iterator = data.iterator();
 
-			// process data
-			while (iterator.hasNext()) {
-				JSONObject document = ((JSONObject) iterator.next()).getJSONObject("_source");
-				DeviceStatus deviceStatus = new DeviceStatus();
-				deviceStatus.setDevice(document.getString("device"));
-				deviceStatus.setTemperature(document.getInt("temperature"));
-				deviceStatus.setTimestamp(document.getString("timestamp"));
-				elkData.add(deviceStatus);
-			}
+			if (data.length() != 0) {
+				// delete data from data_preprocessing
+				request = new Request("POST", "/" + elasticIndexPreprocessing + "/_delete_by_query");
+				jsonInput = "{\r\n" + "    \"query\": {\r\n" + "        \"match_all\": {}\r\n" + "    }\r\n" + "}";
+				request.setJsonEntity(jsonInput);
+				response = restClient.performRequest(request);
 
-			// check temperature values
-			for (DeviceStatus deviceStatus : elkData) {
-				if (deviceStatus.getTemperature() > devicesTemperatureThreshold) {
-					warning.add(deviceStatus);
+				// debug delete_by_query response
+				// System.out.println(EntityUtils.toString(response.getEntity()));
+
+				// parse data from JSON
+				while (iterator.hasNext()) {
+					JSONObject document = ((JSONObject) iterator.next()).getJSONObject("_source");
+					DeviceStatus deviceStatus = new DeviceStatus();
+					deviceStatus.setDevice(document.getString("device"));
+					deviceStatus.setTemperature(document.getInt("temperature"));
+					deviceStatus.setTimestamp(document.getString("timestamp"));
+					elkData.add(deviceStatus);
 				}
-			}
 
-			// process warnings
-			for (DeviceStatus deviceStatus : warning) {
-				if (!warningHistory.contains(deviceStatus)) {
-					sendNotification(deviceStatus);
-					warningHistory.add(deviceStatus);
-					logger.info("processing warning...\n" + deviceStatus.toString());
+				// check temperature values
+				for (DeviceStatus deviceStatus : elkData) {
+					if (deviceStatus.getTemperature() > devicesTemperatureThreshold) {
+						File file = new File("skip-notification");
+						if(!file.exists()) {
+							sendNotification(deviceStatus);	
+						}
+						logger.info(
+								"Warning --> Temperature: {}, Device: {}, Timestamp: {}",
+								deviceStatus.getTemperature(), deviceStatus.getDevice(), deviceStatus.getTimestamp());
+					}
 				}
+
+				// insert data in device_status
+				request = new Request("POST", "/_bulk");
+				jsonInput = "";
+				for (DeviceStatus deviceStatus : elkData) {
+					jsonInput += "{ \"index\" : { \"_index\" : \"" + elasticIndex + "\" }\r\n" + "{ \"device\" : \""
+							+ deviceStatus.getDevice() + "\", \"timestamp\" : \"" + deviceStatus.getTimestamp()
+							+ "\", \"temperature\" : \"" + deviceStatus.getTemperature() + "\" }\n";
+				}
+				request.setJsonEntity(jsonInput);
+				response = restClient.performRequest(request);
+
+				// debug _bulk response
+				// System.out.println(EntityUtils.toString(response.getEntity()));
+
+				logger.info("{} documents moved from data_preprocessing to device_status at {}.", data.length(), new Date());
+				
+			} else {
+				logger.info("the data_preprocessing index is empty at {}", new Date());
+
 			}
 
-			serializeData(warningHistory);
 			restClient.close();
+
 		} catch (IOException e) {
-			// TODO Auto-generated catch block
 			e.printStackTrace();
 		}
 
-	}
-
-	private void serializeData(ArrayList<DeviceStatus> dataToSerialize) {
-		try {
-			FileOutputStream fileOut = new FileOutputStream(alertHistoryFilename);
-			ObjectOutputStream out = new ObjectOutputStream(fileOut);
-			out.writeObject(dataToSerialize);
-			out.close();
-			fileOut.close();
-		} catch (IOException i) {
-			i.printStackTrace();
-		}
-	}
-
-	@SuppressWarnings("unchecked")
-	private ArrayList<DeviceStatus> deserializeData() {
-
-		ArrayList<DeviceStatus> dataToDeserialize = null;
-		try {
-			FileInputStream fileIn = new FileInputStream(alertHistoryFilename);
-			ObjectInputStream in = new ObjectInputStream(fileIn);
-			dataToDeserialize = (ArrayList<DeviceStatus>) in.readObject();
-			in.close();
-			fileIn.close();
-		} catch (IOException i) {
-			i.printStackTrace();
-		} catch (ClassNotFoundException c) {
-			c.printStackTrace();
-		}
-		return dataToDeserialize;
 	}
 
 	private void sendNotification(DeviceStatus deviceStatus) {
 
 		String json = "{\n" + "      \"type\": \"note\",\n" + "      \"title\": \"Alerta temperatura\",\n"
 				+ "      \"body\" : \"Temperatura superior a " + devicesTemperatureThreshold
-				+ "grados en el siguiente dispositivo: " + deviceStatus.getDevice() + " at "
+				+ " grados en el siguiente dispositivo: " + deviceStatus.getDevice() + " at "
 				+ deviceStatus.getTimestamp() + "\"\n" + "}";
 
 		@SuppressWarnings("unused")
